@@ -1,0 +1,253 @@
+# =============================================================================
+# Few-shot example bank
+#
+# Question/SQL pairs. At request time the five most similar to the user's
+# question are selected by nearest-neighbour search and put in the prompt.
+#
+# These are teaching examples, not test cases. Each one is here to demonstrate
+# a *pattern* the model would otherwise get wrong on this schema:
+#
+#   - reach for account_summary, never scan bank_transaction for a balance
+#   - filter disposition_type = 'OWNER' when the question means ownership
+#   - use is_defaulted rather than reasoning about status codes
+#   - strftime('%Y', col) for years, because SQLite has no EXTRACT
+#   - prefer the v_* views when they already contain the needed join
+#
+# EVERY query in this file is executed against the real warehouse by
+# `tests/test_examples.py`. A broken example is worse than no example: it
+# teaches the model the wrong pattern and the mistake is invisible until the
+# benchmark drops. If you add one, the test will tell you if it does not run.
+#
+# `tags` are for humans -- they make it easy to see which patterns are
+# under-represented when accuracy is poor in some category.
+# =============================================================================
+
+examples:
+
+  # -- counting and simple filters -------------------------------------------
+  - question: "How many clients does the bank have?"
+    sql: |
+      SELECT COUNT(*) AS client_count
+      FROM client;
+    tags: [count, simple]
+
+  - question: "How many accounts have a balance over 50000?"
+    sql: |
+      SELECT COUNT(*) AS account_count
+      FROM account_summary
+      WHERE current_balance > 50000;
+    tags: [count, balance, threshold]
+
+  - question: "How many female clients are there?"
+    sql: |
+      SELECT COUNT(*) AS female_client_count
+      FROM client
+      WHERE gender = 'female';
+    tags: [count, gender]
+
+  - question: "How many loans were never repaid?"
+    sql: |
+      SELECT COUNT(*) AS defaulted_loan_count
+      FROM loan
+      WHERE is_defaulted = 1;
+    tags: [count, loan, default]
+
+  # -- ownership: the disposition trap ---------------------------------------
+  - question: "How many clients actually own an account?"
+    sql: |
+      SELECT COUNT(DISTINCT client_id) AS owner_count
+      FROM disposition
+      WHERE disposition_type = 'OWNER';
+    tags: [count, ownership, disposition]
+
+  - question: "Which clients can use an account they do not own?"
+    sql: |
+      SELECT c.client_id, c.gender, c.age_at_1999, d.account_id
+      FROM client c
+      JOIN disposition d ON d.client_id = c.client_id
+      WHERE d.disposition_type = 'DISPONENT'
+      ORDER BY c.client_id
+      LIMIT 20;
+    tags: [ownership, disposition, join]
+
+  # -- balances --------------------------------------------------------------
+  - question: "What is the average account balance?"
+    sql: |
+      SELECT ROUND(AVG(current_balance), 2) AS average_balance
+      FROM account_summary;
+    tags: [aggregate, balance]
+
+  - question: "Show me the 10 accounts with the most money in them."
+    sql: |
+      SELECT account_id, owner_client_id, ROUND(current_balance, 2) AS balance
+      FROM account_summary
+      ORDER BY current_balance DESC
+      LIMIT 10;
+    tags: [top-n, balance, ordering]
+
+  - question: "Which accounts have ever gone overdrawn?"
+    sql: |
+      SELECT account_id, ROUND(min_balance, 2) AS lowest_balance
+      FROM account_summary
+      WHERE min_balance < 0
+      ORDER BY min_balance ASC
+      LIMIT 20;
+    tags: [balance, negative, filter]
+
+  # -- joins across the client/account bridge --------------------------------
+  - question: "What is the average balance held by female account owners?"
+    sql: |
+      SELECT ROUND(AVG(s.current_balance), 2) AS average_balance
+      FROM account_summary s
+      JOIN client c ON c.client_id = s.owner_client_id
+      WHERE c.gender = 'female';
+    tags: [aggregate, join, gender, balance]
+
+  - question: "How many account owners live in Prague?"
+    sql: |
+      SELECT COUNT(DISTINCT c.client_id) AS client_count
+      FROM client c
+      JOIN district d ON d.district_id = c.district_id
+      JOIN disposition dp ON dp.client_id = c.client_id
+      WHERE dp.disposition_type = 'OWNER'
+        AND d.region = 'Prague';
+    tags: [count, join, region, ownership]
+
+  # -- grouping and ranking --------------------------------------------------
+  - question: "How many clients are there in each region?"
+    sql: |
+      SELECT d.region, COUNT(*) AS client_count
+      FROM client c
+      JOIN district d ON d.district_id = c.district_id
+      GROUP BY d.region
+      ORDER BY client_count DESC;
+    tags: [group-by, region, join]
+
+  - question: "Which region has the highest loan default rate?"
+    sql: |
+      SELECT
+          region,
+          COUNT(*) AS loan_count,
+          SUM(is_defaulted) AS defaulted_count,
+          ROUND(100.0 * SUM(is_defaulted) / COUNT(*), 2) AS default_rate_pct
+      FROM v_loan_overview
+      GROUP BY region
+      ORDER BY default_rate_pct DESC
+      LIMIT 1;
+    tags: [group-by, rate, loan, view, ranking]
+
+  - question: "Break down loans by their status."
+    sql: |
+      SELECT status, COUNT(*) AS loan_count, ROUND(AVG(amount), 2) AS average_amount
+      FROM loan
+      GROUP BY status
+      ORDER BY loan_count DESC;
+    tags: [group-by, loan, aggregate]
+
+  # -- dates -----------------------------------------------------------------
+  - question: "How many loans were granted in 1996?"
+    sql: |
+      SELECT COUNT(*) AS loan_count
+      FROM loan
+      WHERE strftime('%Y', loan_date) = '1996';
+    tags: [date, count, loan]
+
+  - question: "How many transactions happened in the first quarter of 1997?"
+    sql: |
+      SELECT COUNT(*) AS transaction_count
+      FROM bank_transaction
+      WHERE transaction_date BETWEEN '1997-01-01' AND '1997-03-31';
+    tags: [date, range, transaction]
+
+  - question: "How many gold cards were issued each year?"
+    sql: |
+      SELECT strftime('%Y', issued_date) AS year, COUNT(*) AS card_count
+      FROM card
+      WHERE card_type = 'gold'
+      GROUP BY year
+      ORDER BY year;
+    tags: [date, group-by, card]
+
+  # -- transactions ----------------------------------------------------------
+  - question: "What is the total amount withdrawn across all accounts?"
+    sql: |
+      SELECT ROUND(SUM(amount), 2) AS total_withdrawn
+      FROM bank_transaction
+      WHERE direction = 'withdrawal';
+    tags: [aggregate, transaction, direction]
+
+  - question: "Which accounts made the most transactions?"
+    sql: |
+      SELECT account_id, transaction_count
+      FROM account_summary
+      ORDER BY transaction_count DESC
+      LIMIT 10;
+    tags: [top-n, transaction, summary]
+
+  - question: "How much was paid in insurance in 1996?"
+    sql: |
+      SELECT ROUND(SUM(amount), 2) AS total_insurance_paid
+      FROM bank_transaction
+      WHERE purpose = 'insurance payment'
+        AND strftime('%Y', transaction_date) = '1996';
+    tags: [aggregate, purpose, date, transaction]
+
+  # -- comparison and subqueries ---------------------------------------------
+  - question: "Which accounts hold more than the average balance?"
+    sql: |
+      SELECT account_id, ROUND(current_balance, 2) AS balance
+      FROM account_summary
+      WHERE current_balance > (SELECT AVG(current_balance) FROM account_summary)
+      ORDER BY current_balance DESC
+      LIMIT 20;
+    tags: [subquery, comparison, balance]
+
+  - question: "Do clients with a loan keep more money in their account than those without?"
+    sql: |
+      SELECT
+          CASE WHEN has_loan = 1 THEN 'has loan' ELSE 'no loan' END AS loan_status,
+          COUNT(*) AS account_count,
+          ROUND(AVG(current_balance), 2) AS average_balance
+      FROM account_summary
+      GROUP BY has_loan;
+    tags: [comparison, group-by, case, balance]
+
+  - question: "How many clients are older than 60 and have a defaulted loan?"
+    sql: |
+      SELECT COUNT(DISTINCT owner_client_id) AS client_count
+      FROM v_loan_overview
+      WHERE borrower_age > 60
+        AND is_defaulted = 1;
+    tags: [count, age, loan, view]
+
+  # -- demographics and regional statistics ----------------------------------
+  - question: "Which districts have unemployment above 4 percent?"
+    sql: |
+      SELECT district_name, region, unemployment_rate_1996
+      FROM district
+      WHERE unemployment_rate_1996 > 4.0
+      ORDER BY unemployment_rate_1996 DESC;
+    tags: [district, filter, demographics]
+
+  - question: "Is there a relationship between average salary and loan defaults by district?"
+    sql: |
+      SELECT
+          district_name,
+          district_average_salary,
+          COUNT(*) AS loan_count,
+          ROUND(100.0 * SUM(is_defaulted) / COUNT(*), 2) AS default_rate_pct
+      FROM v_loan_overview
+      GROUP BY district_name, district_average_salary
+      HAVING COUNT(*) >= 5
+      ORDER BY district_average_salary DESC
+      LIMIT 20;
+    tags: [group-by, having, demographics, view, correlation]
+
+  # -- questions the schema cannot answer ------------------------------------
+  # Teaching the refusal path is as important as teaching the query patterns.
+  # Without an example, a model faced with a missing column invents one.
+  - question: "What are the names and email addresses of our clients?"
+    sql: |
+      -- CANNOT_ANSWER: The bank stores no names or contact details for clients,
+      -- only their birth date, gender and district.
+    tags: [refusal, unanswerable]

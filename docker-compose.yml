@@ -1,0 +1,41 @@
+# docker compose up                  -> API on :8000, docs on :8000/docs
+# docker compose --profile ui up     -> also the Streamlit demo on :8501
+# The warehouse is built once into the shared volume on first start.
+
+x-app: &app
+  build: .
+  image: nl2sql-bank:latest
+  env_file:
+    - path: .env
+      required: false
+  environment:
+    NL2SQL_LOG_FORMAT: json
+  volumes:
+    - warehouse:/app/data
+  restart: unless-stopped
+
+services:
+  api:
+    <<: *app
+    command: serve
+    ports: ["8000:8000"]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 180s   # first start downloads the dataset and builds 1M rows
+      retries: 3
+
+  ui:
+    <<: *app
+    command: ui
+    profiles: ["ui"]
+    ports: ["8501:8501"]
+    healthcheck:
+      disable: true        # the image's check probes the API port
+    depends_on:
+      api:
+        condition: service_healthy
+
+volumes:
+  warehouse:

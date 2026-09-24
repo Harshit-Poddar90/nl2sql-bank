@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nl2sql-bank"
+version = "1.0.0"
+description = "Ask a real 1M-row banking database questions in plain English, with safety-checked SQL."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Harshit Poddar" }]
+keywords = ["text-to-sql", "nl2sql", "llm", "rag", "sql", "banking", "data-engineering"]
+dependencies = [
+    "sqlglot>=25.0",           # SQL -> AST, for the safety validator
+    "SQLAlchemy>=2.0",
+    "pydantic>=2.6",
+    "pydantic-settings>=2.2",
+    "httpx>=0.27",             # every LLM provider is one REST call; no vendor SDKs
+    "numpy>=1.26",
+    "PyYAML>=6.0",
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+    "typer>=0.12",
+    "rich>=13.7",
+]
+
+[project.optional-dependencies]
+embeddings = ["fastembed>=0.3"]        # optional: falls back to a NumPy embedder
+ui = ["streamlit>=1.50", "pandas>=2.0"]
+dev = ["ruff>=0.4", "mypy>=1.10", "types-PyYAML"]
+
+[project.scripts]
+nl2sql = "nl2sql.cli:app"
+
+[project.urls]
+Homepage = "https://github.com/Harshit-Poddar90/nl2sql-bank"
+Documentation = "https://github.com/Harshit-Poddar90/nl2sql-bank/blob/main/docs/ARCHITECTURE.md"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+nl2sql = ["catalog/*.yaml", "data/*.sql", "generation/*.yaml", "evaluation/*.jsonl"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "C4", "SIM", "RUF"]
+ignore = ["E501", "B008", "RUF012"]
+
+[tool.mypy]
+ignore_missing_imports = true

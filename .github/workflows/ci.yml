@@ -1,0 +1,70 @@
+# No API key needed anywhere: the benchmark runs against the offline rule-based generator.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NL2SQL_LLM_PROVIDER: stub
+  NL2SQL_EMBEDDINGS_ENABLED: "false"   # skip the model download; NumPy fallback
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - run: pip install -e ".[dev]"
+      - run: ruff check src app
+      - run: mypy src/nl2sql
+        if: matrix.python-version == '3.12'   # numpy's stubs use 3.12 syntax
+
+      - name: Cache the source dataset
+        uses: actions/cache@v4
+        with:
+          path: data/raw
+          key: berka-csv-v1
+
+      - name: Build and verify the warehouse (row counts, foreign keys, invariants)
+        run: nl2sql data build
+
+      - name: Benchmark the offline baseline (end-to-end smoke test)
+        run: |
+          nl2sql eval --provider stub --quiet
+          python - <<'PY'
+          import json, pathlib, sys
+          report = sorted(pathlib.Path("evaluation/reports").glob("eval-stub-*.json"))[-1]
+          summary = json.loads(report.read_text())["summary"]
+          print(f"accuracy {summary['execution_accuracy']:.1%}, valid SQL {summary['valid_sql_rate']:.1%}")
+          if summary["valid_sql_rate"] < 0.90 or summary["execution_accuracy"] < 0.20:
+              sys.exit("baseline collapsed")
+          PY
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: false
+          tags: nl2sql-bank:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

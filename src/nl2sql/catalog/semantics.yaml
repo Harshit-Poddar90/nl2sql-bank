@@ -1,0 +1,463 @@
+# =============================================================================
+# semantics.yaml -- the business meaning of the warehouse
+#
+# Introspection tells the model what columns exist. This file tells it what
+# they MEAN, which words a user is likely to use for them, and which mistakes
+# are easy to make. It is the single highest-leverage file in the project:
+# editing a description here changes SQL quality far more than editing the
+# prompt template does.
+#
+# It is validated against the live schema on every build. Rename a column
+# without updating this file and the catalog raises CatalogError immediately
+# rather than quietly degrading.
+#
+# Structure:
+#   global_notes  rules that apply to every query
+#   join_hints    the canonical way to connect any two tables
+#   glossary      business term -> what it means here
+#   tables        per-table and per-column descriptions and synonyms
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Rules that apply to every single query. These go into every prompt, so keep
+# the list short and make each line earn its place.
+# -----------------------------------------------------------------------------
+global_notes:
+  - "All money is Czech koruna (CZK). There is no currency column; every amount is CZK."
+  - "The data covers 1993-01-01 to 1998-12-31. There is nothing after 1998, so questions
+     about 'now', 'this year' or 'recently' refer to late 1998."
+  - "Dates are TEXT in 'YYYY-MM-DD' format. Compare them as strings ('1996-01-01') or use
+     strftime('%Y', col). Do not use EXTRACT or DATEPART, which SQLite does not have."
+  - "Coded columns come in pairs: a *_code column holds the original value ('A', 'PRIJEM')
+     and its partner holds a readable label ('finished, paid in full', 'credit').
+     Filtering on either is correct."
+  - "A client and an account are different things. One account is owned by exactly one
+     client, but a client may also be a DISPONENT on someone else's account. When a
+     question says 'customers who have an account', it almost always means owners."
+
+# -----------------------------------------------------------------------------
+# The canonical join paths. Written as literal SQL fragments because that is
+# what actually gets copied -- a model given "client relates to account via
+# disposition" still guesses the column names; a model given the ON clause
+# does not.
+# -----------------------------------------------------------------------------
+join_hints:
+  - "client -> account:  JOIN disposition d ON d.client_id = client.client_id
+                         JOIN account a ON a.account_id = d.account_id
+                         (add d.disposition_type = 'OWNER' for ownership)"
+  - "account -> balance: JOIN account_summary s ON s.account_id = account.account_id
+                         -- use s.current_balance, never scan bank_transaction for this"
+  - "account -> loan:    JOIN loan l ON l.account_id = account.account_id"
+  - "client  -> card:    JOIN disposition d ON d.client_id = client.client_id
+                         JOIN card c ON c.disposition_id = d.disposition_id"
+  - "anything -> region: JOIN district dt ON dt.district_id = <table>.district_id"
+  - "Shortcut: v_account_overview, v_client_overview and v_loan_overview already contain
+     these joins. Prefer them for questions that only need the joined result."
+
+# -----------------------------------------------------------------------------
+# Business vocabulary. Left side is what a person says; right side is what it
+# means in this schema. Only entries mentioning a table in the current prompt
+# are included, so this list can grow without bloating every request.
+# -----------------------------------------------------------------------------
+glossary:
+  balance: >-
+    The money currently in an account: account_summary.current_balance. It is the
+    balance after the account's most recent transaction. Never compute it by summing
+    bank_transaction.amount -- that gives the wrong number and scans a million rows.
+
+  account holder: >-
+    The client with an OWNER row in disposition. Not every client is an account holder;
+    some are only DISPONENTs.
+
+  disponent: >-
+    A person authorised to use an account they do not own. They cannot take out a loan
+    against it. disposition.disposition_type = 'DISPONENT'.
+
+  defaulted loan: >-
+    A loan the client failed to repay. loan.is_defaulted = 1, equivalently
+    status_code IN ('B','D'): B finished unpaid, D still running with the client in debt.
+
+  bad loan: "Same as a defaulted loan: loan.is_defaulted = 1."
+
+  good loan: >-
+    A loan with no repayment problem: loan.is_defaulted = 0, i.e. status_code IN ('A','C').
+
+  active loan: "A loan still running: loan.is_finished = 0, i.e. status_code IN ('C','D')."
+
+  credit: "Money paid INTO an account: bank_transaction.direction = 'credit'."
+
+  withdrawal: "Money taken OUT of an account: bank_transaction.direction = 'withdrawal'."
+
+  region: >-
+    district.region, a broad area such as 'Prague', 'north Moravia', 'south Bohemia'.
+    Coarser than district. There are 8 regions and 77 districts.
+
+  district: >-
+    district.district_name, e.g. 'Hl.m. Praha' (Prague), 'Benesov'. The city of Prague is
+    the district named 'Hl.m. Praha' and is also the whole of the 'Prague' region.
+
+  average salary: >-
+    district.average_salary -- the average monthly wage in that DISTRICT, in CZK. It is a
+    regional statistic, not any individual's income. The bank holds no income data.
+
+  unemployment rate: >-
+    district.unemployment_rate_1996 (or _1995), a percentage for the district. Prefer the
+    1996 figure unless the question names a year; 1995 is NULL for one district.
+
+  senior: "A client aged 60 or over: client.age_at_1999 >= 60."
+
+  young client: "A client under 30: client.age_at_1999 < 30."
+
+  standing order: >-
+    A recurring outgoing payment set up on an account: the permanent_order table.
+    Distinct from a one-off transaction in bank_transaction.
+
+  gold card: "card.card_type = 'gold'. Types are 'junior', 'classic' and 'gold'."
+
+
+# =============================================================================
+# Tables
+# =============================================================================
+tables:
+
+  # ---------------------------------------------------------------------------
+  client:
+    description: "A person known to the bank. 5,369 individuals."
+    synonyms: [customer, customers, people, person, individual, clients, someone, who]
+    notes:
+      - "Reaching a client's account always goes through disposition. There is no
+         client_id on the account table."
+      - "The bank stores no name, income or occupation for a client. Only birth date,
+         gender and district. Questions asking for names cannot be answered."
+    columns:
+      client_id: "Unique identifier for the person."
+      district_id:
+        description: "Where the client lives. Joins to district."
+        synonyms: [lives in, home district, location, from]
+      birth_number:
+        description: "The raw Czech national ID from the source data, kept for provenance.
+                      Do not parse it -- birth_date and gender below are already decoded."
+      birth_date:
+        description: "Date of birth, 'YYYY-MM-DD'. Ranges from 1911 to 1987."
+        synonyms: [born, birthday, date of birth, age]
+      gender:
+        description: "'male' or 'female', decoded from the national ID."
+        synonyms: [sex, men, women, male, female]
+      age_at_1999:
+        description: "Age in whole years as at 1999-01-01, just after the data ends.
+                      Use this for any age question -- it is stable, unlike an age computed
+                      against today's date."
+        synonyms: [age, how old, years old, elderly, young]
+
+  # ---------------------------------------------------------------------------
+  account:
+    description: "A bank account. 4,500 of them."
+    synonyms: [accounts, bank account, banking account]
+    notes:
+      - "account.district_id is the BRANCH's district, which is not always the same as the
+         owner's district. 'Accounts in Prague' and 'clients in Prague' are different
+         questions and both are legitimate."
+      - "The balance is NOT on this table. Join account_summary for it."
+    columns:
+      account_id: "Unique identifier for the account."
+      district_id: "District of the branch holding the account. Joins to district."
+      statement_frequency_code:
+        description: "Original Czech value."
+        values: ["POPLATEK MESICNE", "POPLATEK TYDNE", "POPLATEK PO OBRATU"]
+      statement_frequency:
+        description: "How often statements are issued."
+        synonyms: [statement, statements, frequency, issuance]
+        values: ["monthly", "weekly", "after each transaction"]
+      opened_date:
+        description: "When the account was opened, 'YYYY-MM-DD'. Between 1993 and 1997."
+        synonyms: [opened, created, started, since, when]
+
+  # ---------------------------------------------------------------------------
+  disposition:
+    description: "Links a client to an account and records what they may do with it.
+                  The many-to-many bridge between people and accounts."
+    synonyms: [disp, access, rights, permission, link, relationship, holder]
+    notes:
+      - "THIS IS THE MOST COMMON SOURCE OF WRONG ANSWERS. Every account has exactly one
+         OWNER and may also have one DISPONENT. Counting rows here counts *relationships*,
+         not people and not accounts."
+      - "For 'account holders', 'owners', or anything about taking out a loan, filter
+         disposition_type = 'OWNER'."
+    columns:
+      disposition_id: "Unique identifier. Cards attach to this, not to the client."
+      client_id: "The person."
+      account_id: "The account."
+      disposition_type:
+        description: "'OWNER' can do anything including borrow; 'DISPONENT' may only
+                      transact."
+        synonyms: [owner, owns, disponent, role, type of access]
+        values: ["OWNER", "DISPONENT"]
+
+  # ---------------------------------------------------------------------------
+  card:
+    description: "A credit card issued against a disposition. 892 cards."
+    synonyms: [cards, credit card, debit card, plastic]
+    notes:
+      - "A card belongs to a DISPOSITION, not directly to a client or an account. Getting
+         from a card to its owner takes two joins: card -> disposition -> client."
+    columns:
+      card_id: "Unique identifier for the card."
+      disposition_id: "Which client-account relationship this card belongs to."
+      card_type:
+        description: "Product tier."
+        synonyms: [type, tier, level, gold, classic, junior]
+        values: ["junior", "classic", "gold"]
+      issued_date:
+        description: "Issue date, 'YYYY-MM-DD'."
+        synonyms: [issued, given, when]
+
+  # ---------------------------------------------------------------------------
+  loan:
+    description: "A loan granted against an account, and how it turned out. 682 loans.
+                  Exactly one loan per account at most."
+    synonyms: [loans, credit, borrowing, lending, mortgage, debt]
+    notes:
+      - "Predicting the status of these loans was the original PKDD'99 challenge, so
+         status questions are the most common ones asked of this dataset."
+      - "Use is_defaulted / is_finished rather than reasoning about status codes by hand.
+         'Defaulted' is B *or* D, not just B, which is easy to get wrong."
+    columns:
+      loan_id: "Unique identifier for the loan."
+      account_id: "The account the loan was granted against. Joins to account."
+      loan_date:
+        description: "When the loan was granted, 'YYYY-MM-DD'. Between 1993 and 1998."
+        synonyms: [granted, taken out, when, issued, approved]
+      amount:
+        description: "Total sum borrowed, CZK. Ranges from about 4,980 to 590,820."
+        synonyms: [size, how much, value, principal, borrowed]
+      duration_months:
+        description: "Loan term in months: one of 12, 24, 36, 48 or 60."
+        synonyms: [duration, term, length, months, years, period]
+      monthly_payment:
+        description: "The scheduled repayment per month, CZK."
+        synonyms: [payment, instalment, repayment, per month, monthly]
+      status_code:
+        description: "The raw outcome code."
+        values: ["A", "B", "C", "D"]
+      status:
+        description: "Readable outcome."
+        synonyms: [status, outcome, result, state, how it went]
+        values:
+          - "finished, paid in full"
+          - "finished, not paid (defaulted)"
+          - "running, payments up to date"
+          - "running, client in debt"
+      is_finished:
+        description: "1 if the loan has run its course (status A or B), 0 if still running."
+        synonyms: [finished, completed, closed, over, ended, still running, ongoing]
+      is_defaulted:
+        description: "1 if the client failed to repay (status B or D), 0 otherwise.
+                      THE column for any question about bad loans, defaults or debt.
+                      76 of the 682 loans are defaulted."
+        synonyms: [defaulted, default, bad, unpaid, failed, in debt, delinquent, problem]
+
+  # ---------------------------------------------------------------------------
+  permanent_order:
+    description: "A standing order: a recurring outgoing payment from an account.
+                  6,471 of them. Was called 'order' in the source data."
+    synonyms: [standing order, orders, recurring payment, direct debit, subscription]
+    columns:
+      order_id: "Unique identifier."
+      account_id: "The account being debited."
+      bank_to: "Two-letter code of the receiving bank."
+      account_to: "Account number at the receiving bank."
+      amount:
+        description: "Amount debited each period, CZK."
+        synonyms: [how much, size, value]
+      purpose_code:
+        description: "Raw Czech code for what the payment is for."
+        values: ["POJISTNE", "SIPO", "LEASING", "UVER"]
+      purpose:
+        description: "What the standing order pays for."
+        synonyms: [for, purpose, reason, type, category]
+        values:
+          - "insurance payment"
+          - "household payment"
+          - "leasing payment"
+          - "loan payment"
+
+  # ---------------------------------------------------------------------------
+  bank_transaction:
+    description: "Every individual movement of money. 1,056,320 rows -- by far the
+                  largest table. Was called 'trans' in the source data."
+    synonyms: [transaction, transactions, payment, payments, activity, movement, history]
+    notes:
+      - "This table is large. Always filter by account_id or transaction_date, and never
+         join it without a predicate."
+      - "For a CURRENT BALANCE, use account_summary.current_balance. Do not aggregate this
+         table -- amount is always positive and direction says which way it went, so
+         SUM(amount) is meaningless as a balance."
+      - "balance_after is the running balance at that moment, so it is the right column
+         for historical balance questions ('what was the balance in June 1996')."
+    columns:
+      transaction_id: "Unique identifier."
+      account_id: "The account. Joins to account."
+      transaction_date:
+        description: "'YYYY-MM-DD', from 1993-01-01 to 1998-12-31."
+        synonyms: [date, when, day, month, year, period]
+      direction_code:
+        description: "Raw Czech code. PRIJEM = in, VYDAJ / VYBER = out."
+        values: ["PRIJEM", "VYDAJ", "VYBER"]
+      direction:
+        description: "Which way the money moved."
+        synonyms: [in, out, incoming, outgoing, deposit, withdrawal, credit, debit, spent]
+        values: ["credit", "withdrawal"]
+      operation_code:
+        description: "Raw Czech code for the mechanism used. May be NULL."
+      operation:
+        description: "How the money moved. May be NULL."
+        synonyms: [method, how, mechanism, cash, transfer, card]
+        values:
+          - "cash deposit"
+          - "cash withdrawal"
+          - "collection from another bank"
+          - "remittance to another bank"
+          - "credit card withdrawal"
+      amount:
+        description: "Size of the transaction, CZK. ALWAYS POSITIVE -- the sign lives in
+                      `direction`, so use CASE WHEN direction = 'withdrawal' to net off."
+        synonyms: [how much, value, size, sum]
+      balance_after:
+        description: "The account's running balance immediately after this transaction, CZK.
+                      Can be negative when the account is overdrawn."
+        synonyms: [balance, running balance, balance at the time]
+      purpose_code:
+        description: "Raw Czech code for what the payment was for. May be NULL."
+      purpose:
+        description: "What the payment was for. May be NULL."
+        synonyms: [for, reason, category, type, insurance, pension, interest, household]
+        values:
+          - "insurance payment"
+          - "statement fee"
+          - "interest credited"
+          - "penalty interest for negative balance"
+          - "household payment"
+          - "old-age pension"
+          - "loan payment"
+      partner_bank: "Counterparty bank code. NULL for cash transactions."
+      partner_account: "Counterparty account number. NULL for cash transactions."
+
+  # ---------------------------------------------------------------------------
+  account_summary:
+    description: "PRE-COMPUTED per-account rollup, one row per account. Built from the
+                  million-row transaction table so that balance questions are instant.
+                  Reach for this first."
+    synonyms: [summary, balance, rollup, overview, current state, aggregate]
+    notes:
+      - "This is the fast path. Answering 'how many accounts have more than X' from here
+         takes about a millisecond; doing it from bank_transaction takes about a second."
+      - "Accurate as of the last ETL run. For this historical dataset that means it is
+         simply correct."
+    columns:
+      account_id: "The account. Primary key."
+      owner_client_id:
+        description: "The client who OWNS this account. Saves the join through disposition."
+        synonyms: [owner, holder, whose]
+      district_id: "District of the account's branch."
+      current_balance:
+        description: "Money in the account after its most recent transaction, CZK.
+                      THE column for any 'how much is in the account' question.
+                      Ranges from -25,821 to 138,317; the average is about 43,809."
+        synonyms: [balance, money, funds, savings, amount, holdings, has, more than,
+                   at least, over, richest]
+      first_transaction_date: "Date of the account's first transaction."
+      last_transaction_date: "Date of the account's most recent transaction."
+      transaction_count:
+        description: "Lifetime number of transactions on this account."
+        synonyms: [how many transactions, activity, busy, active]
+      total_credited:
+        description: "Lifetime sum of all money paid in, CZK."
+        synonyms: [total in, deposits, received, income, inflow]
+      total_withdrawn:
+        description: "Lifetime sum of all money taken out, CZK."
+        synonyms: [total out, spending, spent, outflow, withdrawals]
+      average_balance:
+        description: "Mean of balance_after across every transaction on the account, CZK."
+        synonyms: [average balance, typical balance, mean balance]
+      min_balance:
+        description: "Lowest balance the account ever reached, CZK. Negative means it was
+                      overdrawn at some point."
+        synonyms: [lowest, minimum, overdrawn, went negative, worst]
+      max_balance:
+        description: "Highest balance the account ever reached, CZK."
+        synonyms: [highest, maximum, peak, most]
+      has_card:
+        description: "1 if any card is attached to this account."
+        synonyms: [card, has a card, cardholder]
+      has_loan:
+        description: "1 if the account has a loan."
+        synonyms: [loan, borrowed, has a loan]
+      has_defaulted_loan:
+        description: "1 if the account's loan defaulted (status B or D)."
+        synonyms: [defaulted, bad loan, in debt, risky]
+      n_dispositions:
+        description: "How many people can use this account: 1 = sole use, 2 = shared."
+        synonyms: [shared, joint, sole, how many people]
+
+  # ---------------------------------------------------------------------------
+  district:
+    description: "Demographic and economic profile of each of the 77 Czech districts.
+                  Join here for anything regional."
+    synonyms: [districts, region, regions, area, location, place, city, where, demographics]
+    columns:
+      district_id: "Unique identifier. 1 is Prague."
+      district_name:
+        description: "Name of the district, e.g. 'Hl.m. Praha' (Prague), 'Benesov'."
+        synonyms: [district, name, city, town, area, called]
+      region:
+        description: "Broader area. One of 8 values."
+        synonyms: [region, area, part of the country, zone]
+        values: ["Prague", "central Bohemia", "south Bohemia", "west Bohemia",
+                 "north Bohemia", "east Bohemia", "south Moravia", "north Moravia"]
+      inhabitants:
+        description: "Total population of the district."
+        synonyms: [population, people living, size, inhabitants, residents]
+      n_cities: "Number of cities in the district."
+      urban_ratio_pct:
+        description: "Percentage of the district's population living in cities, 0-100."
+        synonyms: [urban, city dwellers, rural, urbanisation]
+      average_salary:
+        description: "Average monthly wage in the district, CZK. From about 8,100 to 12,541.
+                      A property of the DISTRICT, not of any client."
+        synonyms: [salary, wage, income, pay, earnings, rich, wealthy, affluent, poor]
+      unemployment_rate_1995:
+        description: "Unemployment rate in 1995, percent. NULL for one district."
+        synonyms: [unemployment, jobless, out of work]
+      unemployment_rate_1996:
+        description: "Unemployment rate in 1996, percent. The one to prefer."
+        synonyms: [unemployment, jobless, out of work, joblessness]
+      entrepreneurs_per_1000:
+        description: "Entrepreneurs per 1,000 inhabitants."
+        synonyms: [entrepreneurs, business owners, self employed]
+      crimes_1995:
+        description: "Crimes committed in 1995. NULL for one district."
+        synonyms: [crime, crimes, criminality, safety]
+      crimes_1996:
+        description: "Crimes committed in 1996."
+        synonyms: [crime, crimes, criminality, safety]
+
+  # ---------------------------------------------------------------------------
+  # Views. These exist to collapse the common join paths. The model is told to
+  # prefer them, because a correct pre-written join beats one it has to assemble.
+  # ---------------------------------------------------------------------------
+  v_account_overview:
+    description: "READY-MADE JOIN: every account with its district, its owner's details
+                  and its balance. Use this instead of joining account + district +
+                  account_summary + client by hand."
+    synonyms: [account overview, accounts with owners, account details]
+
+  v_client_overview:
+    description: "READY-MADE JOIN: every client with their district's statistics and, if
+                  they own one, their account and its balance. The ownership filter is
+                  already applied. Ideal for 'customers who...' questions."
+    synonyms: [client overview, customer overview, customers with accounts]
+
+  v_loan_overview:
+    description: "READY-MADE JOIN: every loan with its account, district and borrower.
+                  Ideal for any question combining loans with demographics or region."
+    synonyms: [loan overview, loans with borrowers, loan details]

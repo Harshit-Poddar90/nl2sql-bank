@@ -1,0 +1,25 @@
+# Secrets
+.env
+
+# Reproducible data: `nl2sql data build` recreates it (68 MB CSVs, 200 MB warehouse)
+/data/
+
+# Benchmark runs; only the latest report is committed
+evaluation/reports/*
+!evaluation/reports/latest.md
+
+# Python and tooling
+__pycache__/
+*.egg-info/
+build/
+dist/
+.venv/
+.mypy_cache/
+.ruff_cache/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
