@@ -556,10 +556,10 @@ def load_warehouse(
         # Rollup last: it reads from everything above.
         summary_started = time.perf_counter()
         connection.exec_driver_sql(ACCOUNT_SUMMARY_SQL)
-        summary_rows = connection.execute(
+        summary_rows: int = connection.execute(
             text("SELECT COUNT(*) FROM account_summary")
         ).scalar_one()
-        report.tables["account_summary"] = int(summary_rows)
+        report.tables["account_summary"] = summary_rows
         log.info(
             "summary_built",
             extra={"rows": summary_rows,
@@ -789,8 +789,8 @@ def warehouse_exists(settings: Settings | None = None) -> bool:
     try:
         engine = create_engine(settings.db_url, future=True)
         with engine.connect() as connection:
-            count = connection.execute(text("SELECT COUNT(*) FROM account")).scalar_one()
+            count: int = connection.execute(text("SELECT COUNT(*) FROM account")).scalar_one()
         engine.dispose()
-        return int(count) > 0
+        return count > 0
     except Exception:
         return False
